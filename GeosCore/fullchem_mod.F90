@@ -88,6 +88,123 @@ MODULE FullChem_Mod
   REAL(f4), ALLOCATABLE :: JvSumDay  (:,:,:,:)
   REAL(f4), ALLOCATABLE :: JvSumMon  (:,:,:,:)
 
+  !=========================================================================
+  ! BATCHED CHEMISTRY PATH (runtime switch: environment var GC_BATCH_CHEM=1)
+  !
+  ! When enabled, Do_FullChem gathers the per-cell KPP state (C, RCONST,
+  ! ICNTRL, RCNTRL) built by the regular setup loop into flat batch arrays,
+  ! solves all cells in a separate cost-sorted OpenMP loop through the
+  ! argument-based batched integrator (gckpp_BatchIntegrator), and then
+  ! scatters results back exactly as the stock post-solve code does.
+  ! BatchPrevNsteps persists each cell's internal step count between
+  ! chemistry timesteps and is the sort key (most expensive cells first).
+  !=========================================================================
+  LOGICAL, SAVE              :: BatchChemChecked = .FALSE.
+  LOGICAL, SAVE              :: DoBatchChem      = .FALSE.
+  INTEGER, SAVE, ALLOCATABLE :: BatchPrevNsteps(:,:,:)
+
+  !=========================================================================
+  ! GPU BATCH PATH (workstream C): GC_BATCH_CHEM=2
+  !
+  ! Same gather / cost-sort / scatter as GC_BATCH_CHEM=1, but the per-cell
+  ! solve loop is replaced by ONE call per chemistry timestep into
+  ! libgcchemgpu.so (nvfortran/OpenACC build of this tree's own KPP sources
+  ! + gckpp_BatchIntegrator; see $WS/gpulib).  The library is reached
+  ! through the BIND(C) interfaces below, so no .mod files cross the
+  ! gfortran/nvfortran boundary.  Available only when the executable was
+  ! configured with -DGC_GPU_LIB=<path to libgcchemgpu.so> (CPP: GC_GPU_CHEM).
+  ! GC_BATCH_SORT=0 disables the cost sort for either batch mode.
+  !=========================================================================
+  INTEGER,    SAVE :: BatchMode  = 0          ! 0=off, 1=CPU batch, 2=GPU
+  LOGICAL,    SAVE :: BatchSort  = .TRUE.     ! cost-sort the batch?
+  INTEGER,    SAVE :: GpuNcalls  = 0          ! # of library launches
+  INTEGER(8), SAVE :: GpuNcells  = 0          ! cumulative cells solved on GPU
+  INTEGER(8), SAVE :: GpuNretry  = 0          ! cumulative cells retried
+  REAL(KIND=8), SAVE :: GpuTapi    = 0.0d0    ! cum. s inside the API (xfer+kernel)
+  REAL(KIND=8), SAVE :: GpuTkernel = 0.0d0    ! cum. s in the device kernel only
+  REAL(KIND=8), SAVE :: GpuTwall   = 0.0d0    ! cum. s around the API call
+
+  !=========================================================================
+  ! HYBRID PATH: GC_BATCH_CHEM=3
+  !
+  ! The batch is gathered directly in cost order (pre-scan does the counting
+  ! sort), so the GPU solves the expensive head [1..nGpu] with one library
+  ! launch from one OpenMP thread while the remaining OpenMP threads solve
+  ! the tail [nGpu+1..nCell] concurrently.  The cut is chosen on a work
+  ! model (work = previous internal step count) from the measured GPU and
+  ! CPU work rates so that both sides finish together.
+  !   GC_GPU_FRAC=<0..1>     initial fraction of WORK sent to the GPU (0.5)
+  !   GC_GPU_FRAC_FIXED=1    freeze the fraction (no adaptation)
+  !=========================================================================
+  REAL(KIND=8), SAVE :: HybWorkFrac = 0.5d0    ! fraction of work on the GPU
+  LOGICAL,      SAVE :: HybFixedFrac = .FALSE. ! adapt the fraction?
+  REAL(KIND=8), SAVE :: HybRateGpu  = -1.0d0   ! GPU work units / s (EMA)
+  REAL(KIND=8), SAVE :: HybRateCpu  = -1.0d0   ! CPU work units / s (EMA)
+  INTEGER(8),   SAVE :: HybCellsCpu = 0        ! cumulative cells solved on CPU
+  REAL(KIND=8), SAVE :: HybTcpu     = 0.0d0    ! cum. s of the CPU tail loop
+  REAL(KIND=8), SAVE :: HybTsolve   = 0.0d0    ! cum. s of the concurrent solve
+  INTEGER,      SAVE :: HybNdev     = 1        ! # of GPUs driven concurrently
+  REAL(KIND=8), SAVE :: HybDevRate(0:15) = -1.0d0 ! per-device work units / s (EMA)
+  !   Device slices of the GPU head are weighted by these measured rates, so a
+  !   device that is slower (e.g. shared with another job) gets less work.
+  !   GC_GPU_NDEV=<n>        cap on the number of GPUs (default: all visible)
+
+#ifdef GC_GPU_CHEM
+  INTERFACE
+     SUBROUTINE gc_gpu_integrate_batch( nCell, Tstart, Tend, C, RCONST,      &
+                                        ATOL, RTOL, ICNTRL, RCNTRL, Perm,   &
+                                        ISTAT, RSTAT, IERR, tTotal, tKernel )&
+                BIND(C, name='gc_gpu_integrate_batch')
+       USE ISO_C_BINDING, ONLY : c_int, c_double
+       INTEGER(c_int), VALUE         :: nCell
+       REAL(c_double), VALUE         :: Tstart, Tend
+       REAL(c_double), INTENT(INOUT) :: C(*)        ! (NSPEC ,nCell)
+       REAL(c_double), INTENT(IN)    :: RCONST(*)   ! (NREACT,nCell)
+       REAL(c_double), INTENT(IN)    :: ATOL(*), RTOL(*)     ! (NVAR)
+       INTEGER(c_int), INTENT(IN)    :: ICNTRL(*)   ! (20,nCell)
+       REAL(c_double), INTENT(IN)    :: RCNTRL(*)   ! (20,nCell)
+       INTEGER(c_int), INTENT(IN)    :: Perm(*)     ! (nCell) launch order
+       INTEGER(c_int), INTENT(OUT)   :: ISTAT(*)    ! (8,nCell)
+       REAL(c_double), INTENT(OUT)   :: RSTAT(*)    ! (3,nCell)
+       INTEGER(c_int), INTENT(OUT)   :: IERR(*)     ! (nCell)
+       REAL(c_double), INTENT(OUT)   :: tTotal, tKernel
+     END SUBROUTINE gc_gpu_integrate_batch
+     SUBROUTINE gc_gpu_integrate_batch_dev( dev, nCell, Tstart, Tend, C,      &
+                                        RCONST, ATOL, RTOL, ICNTRL, RCNTRL, &
+                                        Perm, ISTAT, RSTAT, IERR, tTotal,   &
+                                        tKernel )                           &
+                BIND(C, name='gc_gpu_integrate_batch_dev')
+       USE ISO_C_BINDING, ONLY : c_int, c_double
+       INTEGER(c_int), VALUE         :: dev         ! device for THIS host thread
+       INTEGER(c_int), VALUE         :: nCell
+       REAL(c_double), VALUE         :: Tstart, Tend
+       REAL(c_double), INTENT(INOUT) :: C(*)        ! (NSPEC ,nCell)
+       REAL(c_double), INTENT(IN)    :: RCONST(*)   ! (NREACT,nCell)
+       REAL(c_double), INTENT(IN)    :: ATOL(*), RTOL(*)     ! (NVAR)
+       INTEGER(c_int), INTENT(IN)    :: ICNTRL(*)   ! (20,nCell)
+       REAL(c_double), INTENT(IN)    :: RCNTRL(*)   ! (20,nCell)
+       INTEGER(c_int), INTENT(IN)    :: Perm(*)     ! (nCell) launch order
+       INTEGER(c_int), INTENT(OUT)   :: ISTAT(*)    ! (8,nCell)
+       REAL(c_double), INTENT(OUT)   :: RSTAT(*)    ! (3,nCell)
+       INTEGER(c_int), INTENT(OUT)   :: IERR(*)     ! (nCell)
+       REAL(c_double), INTENT(OUT)   :: tTotal, tKernel
+     END SUBROUTINE gc_gpu_integrate_batch_dev
+     SUBROUTINE gc_gpu_info( nDev, devName, nameLen )                        &
+                BIND(C, name='gc_gpu_info')
+       USE ISO_C_BINDING, ONLY : c_int, c_char
+       INTEGER(c_int),         INTENT(OUT) :: nDev
+       INTEGER(c_int),         VALUE       :: nameLen
+       CHARACTER(KIND=c_char), INTENT(OUT) :: devName(*)
+     END SUBROUTINE gc_gpu_info
+     SUBROUTINE gc_gpu_selftest( rc, nsteps, tTotal )                        &
+                BIND(C, name='gc_gpu_selftest')
+       USE ISO_C_BINDING, ONLY : c_int, c_double
+       INTEGER(c_int), INTENT(OUT) :: rc, nsteps
+       REAL(c_double), INTENT(OUT) :: tTotal
+     END SUBROUTINE gc_gpu_selftest
+  END INTERFACE
+#endif
+
 #if defined(MPI_LOAD_BALANCE)
   ! For load balancing implementation
   INTEGER                :: NCELL_MAX, NCELL_TOTAL
@@ -164,6 +281,8 @@ CONTAINS
     USE GcKpp_Monitor,            ONLY : SPC_NAMES, FAM_NAMES, EQN_NAMES
     USE GcKpp_Parameters
     USE GcKpp_Integrator,         ONLY : Integrate
+    USE GcKpp_BatchIntegrator,    ONLY : Integrate_Model
+    USE ISO_C_BINDING,            ONLY : c_char, C_NULL_CHAR
     USE GcKpp_Function
     USE GcKpp_Global
     USE GcKpp_Rates,              ONLY : UPDATE_RCONST, RCONST
@@ -257,6 +376,59 @@ CONTAINS
     ! OH reactivity and KPP reaction rate diagnostics
     REAL(fp) :: OHreact
     REAL(dp) :: Vloc(NVAR),     Aout(NREACT)
+
+    ! Batched chemistry path (GC_BATCH_CHEM=1) locals
+    INTEGER               :: nCell, ic, idx, sKey, sMax, sPos
+    INTEGER               :: envStat
+    CHARACTER(LEN=32)     :: envVal
+    INTEGER,  ALLOCATABLE :: BatchMap(:,:)      ! (3,nCell): idx -> I,J,L
+    INTEGER,  ALLOCATABLE :: BatchIdxOf(:,:,:)  ! (I,J,L)   -> idx (0=skip)
+    INTEGER,  ALLOCATABLE :: BatchPerm(:)       ! cost-sorted solve order
+    INTEGER,  ALLOCATABLE :: sCount(:)          ! counting-sort scratch
+    REAL(dp), ALLOCATABLE :: BatchC(:,:)        ! (NSPEC ,nCell) conc in/out
+    REAL(dp), ALLOCATABLE :: BatchRCONST(:,:)   ! (NREACT,nCell) rate consts
+    INTEGER,  ALLOCATABLE :: BatchICNTRL(:,:)   ! (20,nCell) integer options
+    REAL(dp), ALLOCATABLE :: BatchRCNTRL(:,:)   ! (20,nCell) real options
+    INTEGER,  ALLOCATABLE :: BatchISTATUS(:,:)  ! (20,nCell) solver counters
+    REAL(dp), ALLOCATABLE :: BatchRSTATE(:,:)   ! (20,nCell) solver outputs
+    REAL(dp)              :: Cb4(NSPEC)         ! pre-solve C (retry buffer)
+
+    ! GPU batch path (GC_BATCH_CHEM=2) locals
+    INTEGER               :: nFail, kf, gpuNdev, gpuRc, gpuNst
+    INTEGER(8)            :: gpuC0, gpuC1, gpuRate
+    REAL(dp)              :: gpuTa, gpuTk, gpuTw, gpuT2a, gpuT2k
+    REAL(dp), ALLOCATABLE :: BatchC0(:,:)       ! (NSPEC,nCell) pre-solve C
+    INTEGER,  ALLOCATABLE :: BatchISTAT8(:,:)   ! (8,nCell) solver counters
+    REAL(dp), ALLOCATABLE :: BatchRSTAT3(:,:)   ! (3,nCell) Texit,Hexit,Hnew
+    INTEGER,  ALLOCATABLE :: BatchIERR(:)       ! (nCell)   solver status
+    INTEGER,  ALLOCATABLE :: FailIdx(:),        FailPerm(:),   FailIERR(:)
+    INTEGER,  ALLOCATABLE :: FailICNTRL(:,:),   FailISTAT(:,:)
+    REAL(dp), ALLOCATABLE :: FailC(:,:),        FailRCONST(:,:)
+    REAL(dp), ALLOCATABLE :: FailRCNTRL(:,:),   FailRSTAT(:,:)
+    CHARACTER(KIND=c_char):: gpuNameC(256)
+    CHARACTER(LEN=256)    :: gpuName
+
+    ! Hybrid CPU+GPU path (GC_BATCH_CHEM=3) locals
+    INTEGER               :: nGpu, nCpu, nHead, hd
+    INTEGER               :: icl, nLoop, nXY
+    REAL(dp)              :: devW(0:15), devCum, devSum
+    INTEGER,  ALLOCATABLE :: LoopMap(:,:)      ! (3,nLoop) main-loop visit order
+    INTEGER               :: headDone, devNext        ! shared in-loop launch state
+    LOGICAL               :: tailPhase
+    INTEGER(8)            :: lc0, lc1, tLoopStart, tLoopEnd, tMinLaunch
+    INTEGER(8)            :: devT0(0:15)
+    INTEGER(8)            :: hybC0, hybC1
+    INTEGER(8), ALLOCATABLE :: HybWork(:)       ! (0:nCell) work prefix sums
+    REAL(dp)              :: wTot, wTarget, tThr, tCpuMax, tRegion, rNew
+    LOGICAL               :: didGpu
+    INTEGER               :: tid, d, nDevUse
+    INTEGER               :: devLo(0:15), devHi(0:15)
+    REAL(dp)              :: devTa(0:15), devTk(0:15), devTw(0:15)
+#ifdef MODEL_CLASSIC
+#ifndef NO_OMP
+    INTEGER, EXTERNAL     :: OMP_GET_MAX_THREADS
+#endif
+#endif
 
 #ifdef MODEL_CLASSIC
 #ifndef NO_OMP
@@ -545,6 +717,367 @@ CONTAINS
     ATOL = State_Chm%KPP_AbsTol   ! Absolute tolerance
     RTOL = State_Chm%KPP_RelTol   ! Relative tolerance
 
+    !========================================================================
+    ! BATCHED CHEMISTRY: runtime switch + per-timestep setup
+    !
+    ! The switch is the environment variable GC_BATCH_CHEM (=1 to enable),
+    ! read once on the first chemistry timestep.  When OFF (the default),
+    ! the stock code path below runs completely unchanged.
+    !========================================================================
+    IF ( .not. BatchChemChecked ) THEN
+       CALL Get_Environment_Variable( 'GC_BATCH_CHEM', envVal,               &
+                                      STATUS=envStat )
+       BatchMode = 0
+       IF ( envStat == 0 ) THEN
+          IF ( TRIM( envVal ) == '1' ) BatchMode = 1
+          IF ( TRIM( envVal ) == '2' ) BatchMode = 2
+          IF ( TRIM( envVal ) == '3' ) BatchMode = 3
+       ENDIF
+       DoBatchChem = ( BatchMode > 0 )
+#ifndef GC_GPU_CHEM
+       IF ( BatchMode >= 2 ) THEN
+          ErrMsg = 'GC_BATCH_CHEM=2/3 (GPU) requires an executable '      // &
+                   'configured with -DGC_GPU_LIB=<path to libgcchemgpu.so>!'
+          CALL GC_Error( ErrMsg, RC, ThisLoc )
+          RETURN
+       ENDIF
+#endif
+       ! Optional: GC_BATCH_SORT=0 disables the cost sort (stock order)
+       CALL Get_Environment_Variable( 'GC_BATCH_SORT', envVal,               &
+                                      STATUS=envStat )
+       BatchSort = .not. ( envStat == 0 .and. TRIM( envVal ) == '0' )
+       ! Optional (hybrid): initial GPU work fraction and freeze switch
+       CALL Get_Environment_Variable( 'GC_GPU_FRAC', envVal,                 &
+                                      STATUS=envStat )
+       IF ( envStat == 0 .and. LEN_TRIM( envVal ) > 0 ) THEN
+          READ( envVal, * ) HybWorkFrac
+       ENDIF
+       CALL Get_Environment_Variable( 'GC_GPU_FRAC_FIXED', envVal,           &
+                                      STATUS=envStat )
+       HybFixedFrac = ( envStat == 0 .and. TRIM( envVal ) == '1' )
+       HybNdev = 16
+       CALL Get_Environment_Variable( 'GC_GPU_NDEV', envVal,                 &
+                                      STATUS=envStat )
+       IF ( envStat == 0 .and. LEN_TRIM( envVal ) > 0 ) THEN
+          READ( envVal, * ) HybNdev
+       ENDIF
+       IF ( DoBatchChem ) THEN
+          IF ( Input_Opt%Use_AutoReduce ) THEN
+             ErrMsg = 'GC_BATCH_CHEM=1 is incompatible with the '         // &
+                      'auto-reducing solver (set autoreduce_solver '      // &
+                      'activate: false in geoschem_config.yml)!'
+             CALL GC_Error( ErrMsg, RC, ThisLoc )
+             RETURN
+          ENDIF
+          IF ( Input_Opt%amIRoot ) THEN
+             WRITE( 6, '(a)' ) REPEAT( '=', 79 )
+             IF ( BatchMode == 1 ) THEN
+             WRITE( 6, '(a)' ) 'GC_BATCH_CHEM=1: chemistry will be '      // &
+                               'solved as a gathered, cost-sorted batch'
+             WRITE( 6, '(a)' ) 'through the argument-based batched '      // &
+                               'integrator (gckpp_BatchIntegrator).'
+             ELSEIF ( BatchMode == 2 ) THEN
+             WRITE( 6, '(a)' ) 'GC_BATCH_CHEM=2: chemistry will be '      // &
+                               'solved as a gathered, cost-sorted batch'
+             WRITE( 6, '(a)' ) 'on the GPU through libgcchemgpu.so '      // &
+                               '(gc_gpu_integrate_batch, OpenACC).'
+             ELSE
+             WRITE( 6, '(a)' ) 'GC_BATCH_CHEM=3: HYBRID -- the GPU '      // &
+                               '(libgcchemgpu.so) solves the expensive head'
+             WRITE( 6, '(a)' ) 'of the cost-ordered batch while the '     // &
+                               'OpenMP threads solve the tail concurrently.'
+             WRITE( 6, '(a,f6.3,a,l1)' ) 'GC_GPU_FRAC (initial GPU work '  // &
+                               'fraction) = ', HybWorkFrac,                 &
+                               '   fixed = ', HybFixedFrac
+             ENDIF
+             IF ( .not. BatchSort ) THEN
+             WRITE( 6, '(a)' ) 'GC_BATCH_SORT=0: cost sort DISABLED '     // &
+                               '(cells dispatched in stock L,J,I order).'
+             ENDIF
+             WRITE( 6, '(a)' ) REPEAT( '=', 79 )
+          ENDIF
+#ifdef GC_GPU_CHEM
+          IF ( BatchMode >= 2 ) THEN
+             ! Prove the mixed-compiler link + device before any chemistry:
+             ! device query and a one-cell dummy solve inside the library.
+             CALL gc_gpu_info( gpuNdev, gpuNameC, 256 )
+             gpuName = ''
+             DO N = 1, 255
+                IF ( gpuNameC(N) == C_NULL_CHAR ) EXIT
+                gpuName(N:N) = gpuNameC(N)
+             ENDDO
+             CALL gc_gpu_selftest( gpuRc, gpuNst, gpuTa )
+             IF ( Input_Opt%amIRoot ) THEN
+                WRITE( 6, '(a,i0,a,a)' ) 'GC_GPU_CHEM: nDev=', gpuNdev,     &
+                                       '  device=', TRIM( gpuName )
+                WRITE( 6, '(a,i0,a,i0,a,f8.4,a)' )                          &
+                     'GC_GPU_CHEM: selftest rc=', gpuRc, ' nsteps=', gpuNst, &
+                     ' t=', gpuTa, ' s'
+                IF ( gpuRc == 1 .and. gpuNdev > 0 ) THEN
+                   WRITE( 6, '(a)' ) 'GPU selftest OK'
+                ENDIF
+             ENDIF
+             IF ( gpuRc /= 1 .or. gpuNdev < 1 ) THEN
+                ErrMsg = 'GC_BATCH_CHEM=2: GPU selftest FAILED '          // &
+                         '(no device or dummy solve did not converge)!'
+                CALL GC_Error( ErrMsg, RC, ThisLoc )
+                RETURN
+             ENDIF
+             ! Hybrid: one host thread per GPU, so never more devices than
+             ! OpenMP threads (or than the 16 slots of the per-device arrays)
+             HybNdev = MIN( HybNdev, gpuNdev, 16 )
+#ifdef MODEL_CLASSIC
+#ifndef NO_OMP
+             HybNdev = MIN( HybNdev, OMP_GET_MAX_THREADS() )
+#endif
+#endif
+             HybNdev = MAX( HybNdev, 1 )
+             IF ( BatchMode == 3 .and. Input_Opt%amIRoot ) THEN
+                WRITE( 6, '(a,i0,a,i0,a)' ) 'GC_HYB_CHEM: using ', HybNdev,    &
+                     ' of ', gpuNdev, ' visible GPU(s) concurrently'
+             ENDIF
+          ENDIF
+#endif
+          ALLOCATE( BatchPrevNsteps( State_Grid%NX, State_Grid%NY,           &
+                                     State_Grid%NZ ), STAT=RC )
+          IF ( RC /= GC_SUCCESS ) THEN
+             ErrMsg = 'Could not allocate BatchPrevNsteps!'
+             CALL GC_Error( ErrMsg, RC, ThisLoc )
+             RETURN
+          ENDIF
+          BatchPrevNsteps = 0
+       ENDIF
+       BatchChemChecked = .TRUE.
+    ENDIF
+
+    nGpu    = 0
+    nHead   = 0
+    nDevUse = 1
+    IF ( DoBatchChem ) THEN
+
+       ! Pre-scan the grid (serial, cheap) to index the cells that the main
+       ! loop will actually solve.  The tests here MUST mirror the CYCLE
+       ! conditions of the main loop below (chemistry grid + nested buffer).
+       !
+       ! The slot assigned to each cell is its position in a STABLE
+       ! counting sort by the PREVIOUS timestep's internal step count
+       ! (descending), so the batch arrays are gathered directly in cost
+       ! order: the most expensive cells occupy the head of the arrays and
+       ! the solve loops / GPU launch use plain contiguous index ranges.
+       ! With GC_BATCH_SORT=0 (or on the first chemistry timestep, when all
+       ! keys are 0) the slots follow the stock L,J,I loop order.
+       ALLOCATE( BatchIdxOf( State_Grid%NX, State_Grid%NY, State_Grid%NZ ) )
+       BatchIdxOf = 0
+       sMax       = 0
+       IF ( BatchSort ) sMax = MAXVAL( BatchPrevNsteps )
+       ALLOCATE( sCount(0:sMax+1) )
+       sCount     = 0
+       nCell      = 0
+       ! pass 1: count cells per sort key (key 0 = most expensive); the key
+       ! is parked in BatchIdxOf as -(key+1) to mark the cell as selected
+       DO L = 1, State_Grid%NZ
+       DO J = 1, State_Grid%NY
+       DO I = 1, State_Grid%NX
+          IF ( .not. State_Met%InChemGrid(I,J,L) ) CYCLE
+          IF ( State_Grid%NestedGrid ) THEN
+             IF ( J <=                 State_Grid%SouthBuffer ) CYCLE
+             IF ( J >  State_Grid%NY - State_Grid%NorthBuffer ) CYCLE
+             IF ( I <=                 State_Grid%EastBuffer  ) CYCLE
+             IF ( I >  State_Grid%NX - State_Grid%WestBuffer  ) CYCLE
+          ENDIF
+          nCell             = nCell + 1
+          sKey              = 0
+          IF ( BatchSort ) sKey = sMax - BatchPrevNsteps(I,J,L)
+          sCount(sKey)      = sCount(sKey) + 1
+          BatchIdxOf(I,J,L) = -( sKey + 1 )
+       ENDDO
+       ENDDO
+       ENDDO
+       ! prefix sums: first slot of every key
+       sPos = 1
+       DO sKey = 0, sMax
+          idx          = sCount(sKey)
+          sCount(sKey) = sPos
+          sPos         = sPos + idx
+       ENDDO
+       ! pass 2: assign slots (stable within a key: L,J,I order)
+       DO L = 1, State_Grid%NZ
+       DO J = 1, State_Grid%NY
+       DO I = 1, State_Grid%NX
+          IF ( BatchIdxOf(I,J,L) < 0 ) THEN
+             sKey              = -BatchIdxOf(I,J,L) - 1
+             BatchIdxOf(I,J,L) = sCount(sKey)
+             sCount(sKey)      = sCount(sKey) + 1
+          ENDIF
+       ENDDO
+       ENDDO
+       ENDDO
+       DEALLOCATE( sCount )
+
+       ALLOCATE( BatchMap( 3, nCell ), STAT=RC )
+       IF ( RC /= GC_SUCCESS ) THEN
+          ErrMsg = 'Could not allocate BatchMap!'
+          CALL GC_Error( ErrMsg, RC, ThisLoc )
+          RETURN
+       ENDIF
+       DO L = 1, State_Grid%NZ
+       DO J = 1, State_Grid%NY
+       DO I = 1, State_Grid%NX
+          IF ( BatchIdxOf(I,J,L) > 0 ) THEN
+             BatchMap(1,BatchIdxOf(I,J,L)) = I
+             BatchMap(2,BatchIdxOf(I,J,L)) = J
+             BatchMap(3,BatchIdxOf(I,J,L)) = L
+          ENDIF
+       ENDDO
+       ENDDO
+       ENDDO
+
+       !--------------------------------------------------------------------
+       ! How many of the cost-ordered slots are gathered into the batch
+       ! ("the head")?  Modes 1 and 2: all of them.  Mode 3 (hybrid): only
+       ! the GPU's share; the tail is solved IN PLACE by the stock per-cell
+       ! code inside the main loop, concurrently with the GPU launch(es)
+       ! that are issued from inside the same loop as soon as the head has
+       ! been gathered (so the GPU overlaps the CPU's setup AND solve of the
+       ! tail, and the tail pays no gather/scatter at all).
+       !--------------------------------------------------------------------
+       nHead   = nCell
+       nGpu    = 0
+       nCpu    = nCell
+       nDevUse = 1
+       IF ( BatchMode == 3 ) THEN
+          ! Work model: cost(slot) = MAX( previous internal step count, 1 );
+          ! prefix sums over the cost-ordered slots
+          ALLOCATE( HybWork(0:nCell) )
+          HybWork(0) = 0
+          DO ic = 1, nCell
+             HybWork(ic) = HybWork(ic-1) +                                    &
+                  MAX( BatchPrevNsteps( BatchMap(1,ic), BatchMap(2,ic),      &
+                                        BatchMap(3,ic) ), 1 )
+          ENDDO
+          wTot = REAL( HybWork(nCell), dp )
+          IF ( .not. HybFixedFrac .and. HybRateGpu > 0.0_dp .and.            &
+               HybRateCpu > 0.0_dp ) THEN
+             HybWorkFrac = HybRateGpu / ( HybRateGpu + HybRateCpu )
+             HybWorkFrac = MIN( MAX( HybWorkFrac, 0.01_dp ), 0.99_dp )
+          ENDIF
+          HybWorkFrac = MIN( MAX( HybWorkFrac, 0.0_dp ), 1.0_dp )
+          wTarget = HybWorkFrac * wTot
+          DO ic = 1, nCell
+             IF ( REAL( HybWork(ic), dp ) > wTarget ) EXIT
+             nGpu = ic
+          ENDDO
+          nCpu  = nCell - nGpu
+          nHead = nGpu
+          ! device slices of the head (work-balanced, contiguous)
+          nDevUse = HybNdev
+          IF ( nGpu < nDevUse ) nDevUse = MAX( nGpu, 1 )
+          devLo = 1
+          devHi = 0
+          devTa = 0.0_dp
+          devTk = 0.0_dp
+          devTw = 0.0_dp
+          devT0 = 0
+          ! device weights: measured rates once every device has one,
+          ! equal shares before that
+          devW   = 1.0_dp
+          devSum = 0.0_dp
+          IF ( ALL( HybDevRate(0:nDevUse-1) > 0.0_dp ) ) THEN
+             devW(0:nDevUse-1) = HybDevRate(0:nDevUse-1)
+          ENDIF
+          DO d = 0, nDevUse-1
+             devSum = devSum + devW(d)
+          ENDDO
+          idx    = 0
+          devCum = 0.0_dp
+          DO d = 0, nDevUse-1
+             devLo(d) = idx + 1
+             IF ( d == nDevUse-1 ) THEN
+                devHi(d) = nGpu
+             ELSE
+                devCum  = devCum + devW(d)
+                wTarget = REAL( HybWork(nGpu), dp ) * devCum / devSum
+                DO ic = idx+1, nGpu
+                   IF ( REAL( HybWork(ic), dp ) > wTarget ) EXIT
+                   idx = ic
+                ENDDO
+                devHi(d) = idx
+             ENDIF
+             idx = devHi(d)
+          ENDDO
+       ENDIF
+       headDone = 0
+       devNext  = 0
+
+       ! Batch state arrays: everything the per-cell solve needs, gathered
+       ! by the (unchanged) setup loop below; plus the solver outputs.
+       ALLOCATE( BatchC      ( NSPEC,  MAX( nHead, 1 ) ),                    &
+                 BatchRCONST ( NREACT, MAX( nHead, 1 ) ),                    &
+                 BatchICNTRL ( 20,     MAX( nHead, 1 ) ),                    &
+                 BatchRCNTRL ( 20,     MAX( nHead, 1 ) ),                    &
+                 BatchISTATUS( 20,     MAX( nHead, 1 ) ),                    &
+                 BatchRSTATE ( 20,     MAX( nHead, 1 ) ),                    &
+                 BatchPerm   (         MAX( nHead, 1 ) ), STAT=RC )
+       IF ( RC /= GC_SUCCESS ) THEN
+          ErrMsg = 'Could not allocate the batch chemistry arrays!'
+          CALL GC_Error( ErrMsg, RC, ThisLoc )
+          RETURN
+       ENDIF
+       BatchISTATUS = 0
+       BatchRSTATE  = 0.0_dp
+       DO ic = 1, MAX( nHead, 1 )
+          BatchPerm(ic) = ic
+       ENDDO
+       IF ( BatchMode == 3 ) THEN
+          ! retry buffer + solver outputs of the GPU head (filled at gather
+          ! time: the launch modifies BatchC in place)
+          ALLOCATE( BatchC0    ( NSPEC, MAX( nGpu, 1 ) ),                    &
+                    BatchISTAT8( 8,     MAX( nGpu, 1 ) ),                    &
+                    BatchRSTAT3( 3,     MAX( nGpu, 1 ) ),                    &
+                    BatchIERR  (        MAX( nGpu, 1 ) ), STAT=RC )
+          IF ( RC /= GC_SUCCESS ) THEN
+             ErrMsg = 'Could not allocate the hybrid GPU batch arrays!'
+             CALL GC_Error( ErrMsg, RC, ThisLoc )
+             RETURN
+          ENDIF
+          BatchIERR = 1
+       ENDIF
+    ENDIF
+    !------------------------------------------------------------------------
+    ! Main-loop visit order.  Stock: L,J,I (decoded arithmetically, same
+    ! order as the COLLAPSE(3) loop).  Batched/hybrid: the cost-ordered batch
+    ! slots first -- GPU head, then CPU tail -- and the non-chemistry cells
+    ! (which still need their photolysis diagnostics) last.  Visiting the
+    ! head first is what lets the GPU launch happen EARLY in the loop, so
+    ! the GPU solve overlaps the CPU's setup and solve of the tail.
+    !------------------------------------------------------------------------
+    nXY   = State_Grid%NX * State_Grid%NY
+    nLoop = nXY * State_Grid%NZ
+    IF ( DoBatchChem ) THEN
+       ALLOCATE( LoopMap( 3, nLoop ), STAT=RC )
+       IF ( RC /= GC_SUCCESS ) THEN
+          ErrMsg = 'Could not allocate LoopMap!'
+          CALL GC_Error( ErrMsg, RC, ThisLoc )
+          RETURN
+       ENDIF
+       LoopMap(:,1:nCell) = BatchMap(:,1:nCell)
+       icl = nCell
+       DO L = 1, State_Grid%NZ
+       DO J = 1, State_Grid%NY
+       DO I = 1, State_Grid%NX
+          IF ( BatchIdxOf(I,J,L) == 0 ) THEN
+             icl            = icl + 1
+             LoopMap(1,icl) = I
+             LoopMap(2,icl) = J
+             LoopMap(3,icl) = L
+          ENDIF
+       ENDDO
+       ENDDO
+       ENDDO
+    ENDIF
+    CALL SYSTEM_CLOCK( tLoopStart, gpuRate )
+    tailPhase = .FALSE.
+
 #if defined(MPI_LOAD_BALANCE)
     ! For load balancing
     NCELL_local = offset
@@ -604,26 +1137,86 @@ CONTAINS
     !========================================================================
     !$OMP PARALLEL DO                                                        &
     !$OMP DEFAULT( SHARED                                                   )&
-    !$OMP PRIVATE( I,        J,        L,       N                           )&
+    !$OMP PRIVATE( I,        J,        L,       N,         idx              )&
     !$OMP PRIVATE( ICNTRL,   C_before_integrate                             )&
     !$OMP PRIVATE( KPPH_before_integrate,       local_RCONST                )&
     !$OMP PRIVATE( SO4_FRAC, IERR,     RCNTRL,  ISTATUS,   RSTATE           )&
     !$OMP PRIVATE( SpcID,    KppID,    F,       P,         Vloc             )&
     !$OMP PRIVATE( Aout,     Thread,   RC,      S,         LCH4             )&
     !$OMP PRIVATE( OHreact,  PCO_TOT,  PCO_CH4, PCO_NMVOC, SR               )&
-    !$OMP PRIVATE( SIZE_RES, LWC                                            )&
+    !$OMP PRIVATE( SIZE_RES, LWC,      hd,      d,         icl              )&
+    !$OMP FIRSTPRIVATE( tailPhase                                           )&
+    !$OMP PRIVATE( lc0,      lc1                                            )&
 #ifdef MODEL_GEOS
     !$OMP PRIVATE( NOxTau,     NOxConc, NOx_weight, NOx_tau_weighted        )&
 #endif
+#ifdef MPI_LOAD_BALANCE
     !$OMP COLLAPSE( 3                                                       )&
+#endif
     !$OMP SCHEDULE( DYNAMIC, 24                                             )&
     !$OMP REDUCTION( +:errorCount                                           )
+#ifndef MPI_LOAD_BALANCE
+    DO icl = 1, nLoop
+       IF ( DoBatchChem ) THEN
+          I = LoopMap(1,icl)
+          J = LoopMap(2,icl)
+          L = LoopMap(3,icl)
+       ELSE
+          ! same cell order as the stock COLLAPSE(3) L,J,I loop
+          L = ( icl - 1 ) / nXY + 1
+          J = MOD( icl - 1, nXY ) / State_Grid%NX + 1
+          I = MOD( icl - 1, State_Grid%NX ) + 1
+       ENDIF
+#else
     DO L = 1, State_Grid%NZ
     DO J = 1, State_Grid%NY
     DO I = 1, State_Grid%NX
+#endif
 
        ! Skip to the end of the loop if we have failed integration twice
        IF ( Failed2x ) CYCLE
+
+#ifndef MPI_LOAD_BALANCE
+#ifdef GC_GPU_CHEM
+       !=====================================================================
+       ! HYBRID (GC_BATCH_CHEM=3): launch the GPU(s) FROM INSIDE THE LOOP.
+       ! The first nDevUse threads to notice that every head cell has been
+       ! gathered each claim one device and issue its (blocking) launch
+       ! right here, in their current loop iteration; the other threads
+       ! keep taking iterations, i.e. they set up and solve the tail cells
+       ! in place while the GPUs run.  Threads never check again once they
+       ! have seen the head complete (tailPhase).
+       !=====================================================================
+       IF ( BatchMode == 3 .and. nGpu > 0 ) THEN
+          IF ( .not. tailPhase ) THEN
+             !$OMP ATOMIC READ
+             hd = headDone
+             IF ( hd >= nGpu ) THEN
+                tailPhase = .TRUE.
+                !$OMP ATOMIC CAPTURE
+                d       = devNext
+                devNext = devNext + 1
+                !$OMP END ATOMIC
+                IF ( d < nDevUse ) THEN
+                   IF ( devHi(d) >= devLo(d) ) THEN
+                      CALL SYSTEM_CLOCK( lc0 )
+                      devT0(d) = lc0
+                      CALL gc_gpu_integrate_batch_dev( d, devHi(d)-devLo(d)+1, &
+                           0.0_dp, DT, BatchC(1,devLo(d)),                   &
+                           BatchRCONST(1,devLo(d)), ATOL, RTOL,              &
+                           BatchICNTRL(1,devLo(d)), BatchRCNTRL(1,devLo(d)), &
+                           BatchPerm, BatchISTAT8(1,devLo(d)),               &
+                           BatchRSTAT3(1,devLo(d)), BatchIERR(devLo(d)),     &
+                           devTa(d), devTk(d) )
+                      CALL SYSTEM_CLOCK( lc1 )
+                      devTw(d) = REAL( lc1 - lc0, dp ) / REAL( gpuRate, dp )
+                   ENDIF
+                ENDIF
+             ENDIF
+          ENDIF
+       ENDIF
+#endif
+#endif
 
        !=====================================================================
        ! Initialize private loop variables for each (I,J,L)
@@ -1097,6 +1690,30 @@ CONTAINS
 
 #ifndef MPI_LOAD_BALANCE
        !=====================================================================
+       ! BATCHED CHEMISTRY: gather this cell's fully-prepared per-cell KPP
+       ! state into the batch arrays and defer the solve to the cost-sorted
+       ! batch loop that follows this parallel loop.  Everything gathered
+       ! here was built by the unchanged setup code above (same unit
+       ! conversions, same rate-constant updates, same het-chem state).
+       !=====================================================================
+       IF ( DoBatchChem ) THEN
+          idx = BatchIdxOf(I,J,L)
+          IF ( idx <= nHead ) THEN
+             BatchC(:,idx)      = C
+             BatchRCONST(:,idx) = RCONST
+             BatchICNTRL(:,idx) = ICNTRL
+             BatchRCNTRL(:,idx) = RCNTRL
+             IF ( BatchMode == 3 ) THEN
+                BatchC0(:,idx) = C
+                !$OMP ATOMIC
+                headDone = headDone + 1
+             ENDIF
+             CYCLE
+          ENDIF
+          ! tail slot (hybrid): fall through to the stock in-place solve
+       ENDIF
+
+       !=====================================================================
        ! Integrate the box forwards (if not using MPI load balancing)
        !=====================================================================
 
@@ -1376,6 +1993,10 @@ CONTAINS
        ! Hstart will be initialized to the value of Hnew from the restart
        ! file at startup (see above).
        State_Chm%KPPHvalue(I,J,L) = RSTATE(Nhnew)
+
+       ! Batched/hybrid chemistry: this cell's internal step count is the
+       ! next timestep's cost-sort key (tail cells solved in place)
+       IF ( DoBatchChem ) BatchPrevNsteps(I,J,L) = ISTATUS(3)
 
        ! Save cpu time spent for bulk of KPP-related routines for 
        ! History archival (hplin, 11/8/21)
@@ -1657,10 +2278,802 @@ CONTAINS
        cell_status(NCELL_local) = cell_status(NCELL_local) - 1
 #endif  ! MPI_LOAD_BALANCE
 
+#ifndef MPI_LOAD_BALANCE
+    ENDDO ! icl
+#else
     ENDDO ! I
     ENDDO ! J
     ENDDO ! L
+#endif
     !$OMP END PARALLEL DO
+    CALL SYSTEM_CLOCK( tLoopEnd )
+    IF ( ALLOCATED( LoopMap ) ) DEALLOCATE( LoopMap )
+
+#ifndef MPI_LOAD_BALANCE
+    !=======================================================================
+    ! BATCHED CHEMISTRY: cost-sorted batch solve + scatter
+    !
+    ! (b) Sort the batch by the PREVIOUS timestep's per-cell internal step
+    !     count (descending).  The sort is a permutation array only: the
+    !     batch data stays in place, we just dispatch the most expensive
+    !     cells first so the dynamic OpenMP schedule balances well (and so
+    !     a future CPU/GPU split can peel the expensive head of the list).
+    !     On the first chemistry timestep all keys are 0 => stock order.
+    ! (c) Solve every cell through the ARGUMENT-BASED batched integrator
+    !     (Integrate_Model -> Integrate_Cell_S), replicating the stock
+    !     retry-on-failure logic.
+    ! (d) Scatter results back with the same post-solve code as the stock
+    !     loop (concentrations, warm-start cache, diagnostics).
+    !=======================================================================
+    IF ( DoBatchChem .and. ( .not. Failed2x ) ) THEN
+
+       ! (b) The batch arrays were gathered directly in cost order (see the
+       !     pre-scan); BatchPerm is the identity (set there).
+
+#ifdef GC_GPU_CHEM
+       IF ( BatchMode == 2 ) THEN
+       !--------------------------------------------------------------------
+       ! (c-GPU) Solve the whole batch with ONE library launch.  Cell ic of
+       ! the launch solves column BatchPerm(ic), so the cost-sorted order
+       ! is honoured without repacking.  The library returns the same
+       ! ISTATUS(1:8)/RSTATE(1:3) bookkeeping the CPU path gets from
+       ! Integrate_Model.  The retry-on-failure protocol is identical to
+       ! the CPU loop (reset C, zero Hstart, solve again, accumulate
+       ! counters, abort with the same debug printout on a 2nd failure);
+       ! the failed cells are re-launched as a small second batch.
+       !--------------------------------------------------------------------
+       ALLOCATE( BatchC0    ( NSPEC, nCell ),                                &
+                 BatchISTAT8( 8,     nCell ),                                &
+                 BatchRSTAT3( 3,     nCell ),                                &
+                 BatchIERR  (        nCell ), STAT=RC )
+       IF ( RC /= GC_SUCCESS ) THEN
+          ErrMsg = 'Could not allocate the GPU batch arrays!'
+          CALL GC_Error( ErrMsg, RC, ThisLoc )
+          RETURN
+       ENDIF
+
+       ! Keep the pre-solve concentrations (retry buffer, all cells)
+       !$OMP PARALLEL DO DEFAULT( SHARED ) PRIVATE( ic )
+       DO ic = 1, nCell
+          BatchC0(:,ic) = BatchC(:,ic)
+       ENDDO
+       !$OMP END PARALLEL DO
+
+       ! ---- the launch (serial, from the master thread) ----
+       CALL SYSTEM_CLOCK( gpuC0, gpuRate )
+       CALL gc_gpu_integrate_batch( nCell, 0.0_dp, DT, BatchC, BatchRCONST,  &
+                                    ATOL, RTOL, BatchICNTRL, BatchRCNTRL,    &
+                                    BatchPerm, BatchISTAT8, BatchRSTAT3,     &
+                                    BatchIERR, gpuTa, gpuTk )
+       CALL SYSTEM_CLOCK( gpuC1 )
+       gpuTw      = REAL( gpuC1 - gpuC0, dp ) / REAL( gpuRate, dp )
+       GpuNcalls  = GpuNcalls  + 1
+       GpuNcells  = GpuNcells  + nCell
+       GpuTapi    = GpuTapi    + gpuTa
+       GpuTkernel = GpuTkernel + gpuTk
+       GpuTwall   = GpuTwall   + gpuTw
+
+       ! Post-process attempt 1 (host, threaded): counters, negatives diag
+       nFail = 0
+       !$OMP PARALLEL DO                                                     &
+       !$OMP DEFAULT( SHARED                                                )&
+       !$OMP PRIVATE( ic, I, J, L                                           )&
+       !$OMP REDUCTION( +:nFail                                             )
+       DO ic = 1, nCell
+          BatchISTATUS(1:8,ic) = BatchISTAT8(:,ic)
+          BatchRSTATE (1:3,ic) = BatchRSTAT3(:,ic)
+          IF ( State_Diag%Archive_KppDiags ) THEN
+             IF ( State_Diag%Archive_KppNegatives0 ) THEN
+                I = BatchMap(1,ic)
+                J = BatchMap(2,ic)
+                L = BatchMap(3,ic)
+                State_Diag%KppNegatives0(I,J,L) =                            &
+                     REAL( COUNT( BatchC(:,ic) < 0.0_dp ), KIND=4 )
+             ENDIF
+          ENDIF
+          IF ( BatchIERR(ic) < 0 ) nFail = nFail + 1
+       ENDDO
+       !$OMP END PARALLEL DO
+
+       IF ( Input_Opt%amIRoot ) THEN
+          WRITE( 6, '(a,i4,a,i7,a,i5,a,f8.3,a,f8.3,a,f8.3,a,f9.2,a,f9.2)' )  &
+               'GC_GPU_CHEM: call', GpuNcalls, ' nCell=', nCell,             &
+               ' nFail=', nFail, ' api_s=', gpuTa, ' kernel_s=', gpuTk,      &
+               ' wall_s=', gpuTw, ' cum_api_s=', GpuTapi,                    &
+               ' cum_kernel_s=', GpuTkernel
+       ENDIF
+
+       !------------------------------------------------------------------
+       ! Retry failed cells (same protocol as the CPU loop)
+       !------------------------------------------------------------------
+       IF ( nFail > 0 ) THEN
+          ALLOCATE( FailIdx   (         nFail ), FailPerm  (      nFail ),   &
+                    FailC     ( NSPEC,  nFail ), FailRCONST( NREACT, nFail ),&
+                    FailICNTRL( 20,     nFail ), FailRCNTRL( 20,   nFail ),  &
+                    FailISTAT ( 8,      nFail ), FailRSTAT ( 3,    nFail ),  &
+                    FailIERR  (         nFail ) )
+          kf = 0
+          DO ic = 1, nCell
+             IF ( BatchIERR(ic) < 0 ) THEN
+                I = BatchMap(1,ic)
+                J = BatchMap(2,ic)
+                L = BatchMap(3,ic)
+                ! Print grid box indices to screen if integrate failed
+                IF ( .not. doSuppress ) THEN
+                   WRITE( 6, * ) '### INTEGRATE RETURNED ERROR AT: ', I, J, L
+                   errorCount = errorCount + 1
+                   IF ( errorCount > INTEGRATE_FAIL_TOGGLE ) THEN
+                      WRITE( 6, '(a)' ) &
+                         '### Further error output has been switched off'
+                   ENDIF
+                ENDIF
+                ! Zero Hstart and reset C to its pre-solve values
+                kf                 = kf + 1
+                FailIdx(kf)        = ic
+                FailPerm(kf)       = kf
+                FailC(:,kf)        = BatchC0(:,ic)
+                FailRCONST(:,kf)   = BatchRCONST(:,ic)
+                FailICNTRL(:,kf)   = BatchICNTRL(:,ic)
+                FailRCNTRL(:,kf)   = BatchRCNTRL(:,ic)
+                FailRCNTRL(3,kf)   = 0.0_dp
+             ENDIF
+          ENDDO
+
+          ! Call the integrator again (2nd launch, failed cells only)
+          CALL gc_gpu_integrate_batch( nFail, 0.0_dp, DT, FailC, FailRCONST, &
+                                       ATOL, RTOL, FailICNTRL, FailRCNTRL,   &
+                                       FailPerm, FailISTAT, FailRSTAT,       &
+                                       FailIERR, gpuT2a, gpuT2k )
+          GpuNretry  = GpuNretry  + nFail
+          GpuTapi    = GpuTapi    + gpuT2a
+          GpuTkernel = GpuTkernel + gpuT2k
+          GpuTwall   = GpuTwall   + gpuT2a
+
+          DO kf = 1, nFail
+             ic = FailIdx(kf)
+             I  = BatchMap(1,ic)
+             J  = BatchMap(2,ic)
+             L  = BatchMap(3,ic)
+             BatchC(:,ic)         = FailC(:,kf)
+             ! Accumulate counters over both attempts
+             BatchISTATUS(1:8,ic) = BatchISTATUS(1:8,ic) + FailISTAT(:,kf)
+             BatchRSTATE (1:3,ic) = FailRSTAT(:,kf)
+
+             !===========================================================
+             ! Exit upon the second failure
+             !===========================================================
+             IF ( FailIERR(kf) < 0 ) THEN
+                WRITE(6,     '(a   )' ) '## INTEGRATE FAILED TWICE !!! '
+                WRITE(ERRMSG,'(a,i3)' ) 'Integrator error code :',           &
+                                        FailIERR(kf)
+                Failed2x = .TRUE.
+                PRINT*, REPEAT( '#', 79 )
+                PRINT*, '### KPP DEBUG OUTPUT!'
+                PRINT*, '### Species concentrations at problem box ', I, J, L
+                PRINT*, REPEAT( '#', 79 )
+                DO N = 1, NSPEC
+                   PRINT*, BatchC(N,ic), TRIM( ADJUSTL( SPC_NAMES(N) ) )
+                ENDDO
+                PRINT*, REPEAT( '#', 79 )
+                PRINT*, '### KPP DEBUG OUTPUT!'
+                PRINT*, '### Reaction rates at problem box ', I, J, L
+                PRINT*, REPEAT( '#', 79 )
+                DO N = 1, NREACT
+                   PRINT*, BatchRCONST(N,ic), TRIM( ADJUSTL( EQN_NAMES(N) ) )
+                ENDDO
+                EXIT
+             ENDIF
+          ENDDO
+          DEALLOCATE( FailIdx, FailPerm, FailC, FailRCONST, FailICNTRL,      &
+                      FailRCNTRL, FailISTAT, FailRSTAT, FailIERR )
+       ENDIF
+
+       ! Persist each cell's internal step count (next timestep's sort key)
+       ! and the solve-time diagnostic.  The GPU has no per-cell timer, so
+       ! KppTime is the launch wall time spread evenly over the cells.
+       IF ( .not. Failed2x ) THEN
+          !$OMP PARALLEL DO DEFAULT( SHARED ) PRIVATE( ic, I, J, L )
+          DO ic = 1, nCell
+             I = BatchMap(1,ic)
+             J = BatchMap(2,ic)
+             L = BatchMap(3,ic)
+             BatchPrevNsteps(I,J,L) = BatchISTATUS(3,ic)
+             IF ( State_Diag%Archive_KppTime ) THEN
+                State_Diag%KppTime(I,J,L) = gpuTw / REAL( nCell, dp )
+             ENDIF
+          ENDDO
+          !$OMP END PARALLEL DO
+       ENDIF
+       DEALLOCATE( BatchC0, BatchISTAT8, BatchRSTAT3, BatchIERR )
+
+       ELSEIF ( BatchMode == 3 ) THEN
+       !--------------------------------------------------------------------
+       ! (c-HYBRID) The GPU launches were issued from inside the main loop
+       ! (see there) and the CPU tail was solved in place by the stock code.
+       ! Here: fall-back launches for any device slice that no thread got
+       ! to claim (e.g. the head completed in the loop's very last
+       ! iterations), then the head's post-processing, failure retries,
+       ! rate estimates and diagnostics.
+       !--------------------------------------------------------------------
+       tMinLaunch = tLoopEnd
+       DO d = 0, MIN( devNext, nDevUse ) - 1
+          IF ( devHi(d) >= devLo(d) ) tMinLaunch = MIN( tMinLaunch, devT0(d) )
+       ENDDO
+       DO d = devNext, nDevUse-1
+          IF ( devHi(d) >= devLo(d) ) THEN
+             CALL SYSTEM_CLOCK( gpuC0 )
+             devT0(d) = gpuC0
+             CALL gc_gpu_integrate_batch_dev( d, devHi(d)-devLo(d)+1, 0.0_dp, &
+                          DT, BatchC(1,devLo(d)), BatchRCONST(1,devLo(d)),    &
+                          ATOL, RTOL, BatchICNTRL(1,devLo(d)),                &
+                          BatchRCNTRL(1,devLo(d)), BatchPerm,                 &
+                          BatchISTAT8(1,devLo(d)), BatchRSTAT3(1,devLo(d)),   &
+                          BatchIERR(devLo(d)), devTa(d), devTk(d) )
+             CALL SYSTEM_CLOCK( gpuC1 )
+             devTw(d) = REAL( gpuC1 - gpuC0, dp ) / REAL( gpuRate, dp )
+          ENDIF
+       ENDDO
+       CALL SYSTEM_CLOCK( hybC1 )
+       tRegion = REAL( hybC1 - tLoopStart, dp ) / REAL( gpuRate, dp )
+       ! GPU side: devices ran concurrently -> slowest device; API/kernel
+       ! seconds summed over devices.  CPU side: the tail was set up and
+       ! solved between the first launch and the end of the loop.
+       gpuTa = 0.0_dp
+       gpuTk = 0.0_dp
+       gpuTw = 0.0_dp
+       DO d = 0, nDevUse-1
+          gpuTa = gpuTa + devTa(d)
+          gpuTk = gpuTk + devTk(d)
+          gpuTw = MAX( gpuTw, devTw(d) )
+       ENDDO
+       tCpuMax = REAL( hybC1 - tMinLaunch, dp ) / REAL( gpuRate, dp )
+       tThr    = REAL( tMinLaunch - tLoopStart, dp ) / REAL( gpuRate, dp )
+
+       ! ---- GPU head: counters, negatives diagnostic, failure count ----
+       nFail = 0
+       !$OMP PARALLEL DO                                                     &
+       !$OMP DEFAULT( SHARED                                                )&
+       !$OMP PRIVATE( ic, I, J, L                                           )&
+       !$OMP REDUCTION( +:nFail                                             )
+       DO ic = 1, nGpu
+          BatchISTATUS(1:8,ic) = BatchISTAT8(:,ic)
+          BatchRSTATE (1:3,ic) = BatchRSTAT3(:,ic)
+          IF ( State_Diag%Archive_KppDiags ) THEN
+             IF ( State_Diag%Archive_KppNegatives0 ) THEN
+                I = BatchMap(1,ic)
+                J = BatchMap(2,ic)
+                L = BatchMap(3,ic)
+                State_Diag%KppNegatives0(I,J,L) =                            &
+                     REAL( COUNT( BatchC(:,ic) < 0.0_dp ), KIND=4 )
+             ENDIF
+          ENDIF
+          IF ( BatchIERR(ic) < 0 ) nFail = nFail + 1
+       ENDDO
+       !$OMP END PARALLEL DO
+
+       ! Cells that failed on the GPU are retried on the CPU with the stock
+       ! protocol (reset C, zero Hstart, solve again; abort on 2nd failure)
+       IF ( nFail > 0 .and. ( .not. Failed2x ) ) THEN
+          DO ic = 1, nGpu
+             IF ( BatchIERR(ic) >= 0 ) CYCLE
+             I = BatchMap(1,ic)
+             J = BatchMap(2,ic)
+             L = BatchMap(3,ic)
+             IF ( .not. doSuppress ) THEN
+                WRITE( 6, * ) '### INTEGRATE RETURNED ERROR AT: ', I, J, L
+                errorCount = errorCount + 1
+                IF ( errorCount > INTEGRATE_FAIL_TOGGLE ) THEN
+                   WRITE( 6, '(a)' ) &
+                      '### Further error output has been switched off'
+                   doSuppress = .TRUE.
+                ENDIF
+             ENDIF
+             ICNTRL       = BatchICNTRL(:,ic)
+             RCNTRL       = BatchRCNTRL(:,ic)
+             RCNTRL(3)    = 0.0_dp
+             BatchC(:,ic) = BatchC0(:,ic)
+             CALL Integrate_Model( 0.0_dp, DT, ICNTRL, RCNTRL, ATOL, RTOL,   &
+                                   BatchC(1:NVAR,ic),                        &
+                                   BatchC(NVAR+1:NSPEC,ic),                  &
+                                   BatchRCONST(:,ic),                        &
+                                   ISTATUS, RSTATE, IERR )
+             BatchISTATUS(:,ic) = BatchISTATUS(:,ic) + ISTATUS
+             BatchRSTATE(:,ic)  = RSTATE
+             GpuNretry          = GpuNretry + 1
+             IF ( IERR < 0 ) THEN
+                WRITE(6,     '(a   )' ) '## INTEGRATE FAILED TWICE !!! '
+                WRITE(ERRMSG,'(a,i3)' ) 'Integrator error code :', IERR
+                Failed2x = .TRUE.
+                PRINT*, REPEAT( '#', 79 )
+                PRINT*, '### KPP DEBUG OUTPUT!'
+                PRINT*, '### Species concentrations at problem box ', I, J, L
+                PRINT*, REPEAT( '#', 79 )
+                DO N = 1, NSPEC
+                   PRINT*, BatchC(N,ic), TRIM( ADJUSTL( SPC_NAMES(N) ) )
+                ENDDO
+                PRINT*, REPEAT( '#', 79 )
+                PRINT*, '### KPP DEBUG OUTPUT!'
+                PRINT*, '### Reaction rates at problem box ', I, J, L
+                PRINT*, REPEAT( '#', 79 )
+                DO N = 1, NREACT
+                   PRINT*, BatchRCONST(N,ic), TRIM( ADJUSTL( EQN_NAMES(N) ) )
+                ENDDO
+                EXIT
+             ENDIF
+          ENDDO
+       ENDIF
+
+       ! Persist the GPU head's step counts (next timestep's sort key and
+       ! work model) and the solve-time diagnostic (launch wall time spread
+       ! evenly over the head cells; the tail was timed per cell in place).
+       IF ( .not. Failed2x ) THEN
+          !$OMP PARALLEL DO DEFAULT( SHARED ) PRIVATE( ic, I, J, L )
+          DO ic = 1, nGpu
+             I = BatchMap(1,ic)
+             J = BatchMap(2,ic)
+             L = BatchMap(3,ic)
+             BatchPrevNsteps(I,J,L) = BatchISTATUS(3,ic)
+             IF ( State_Diag%Archive_KppTime ) THEN
+                State_Diag%KppTime(I,J,L) = gpuTw / REAL( MAX( nGpu, 1 ), dp )
+             ENDIF
+          ENDDO
+          !$OMP END PARALLEL DO
+       ENDIF
+
+       ! ---- update the measured work rates (EMA) for the next split ----
+       DO d = 0, nDevUse-1
+          IF ( devHi(d) >= devLo(d) .and. devTw(d) > 0.0_dp ) THEN
+             rNew = REAL( HybWork(devHi(d)) - HybWork(devLo(d)-1), dp )      &
+                    / devTw(d)
+             IF ( HybDevRate(d) > 0.0_dp ) THEN
+                HybDevRate(d) = 0.5_dp * HybDevRate(d) + 0.5_dp * rNew
+             ELSE
+                HybDevRate(d) = rNew
+             ENDIF
+          ENDIF
+       ENDDO
+       IF ( nGpu > 0 .and. gpuTw > 0.0_dp ) THEN
+          rNew = REAL( HybWork(nGpu), dp ) / gpuTw
+          IF ( HybRateGpu > 0.0_dp ) THEN
+             HybRateGpu = 0.5_dp * HybRateGpu + 0.5_dp * rNew
+          ELSE
+             HybRateGpu = rNew
+          ENDIF
+       ENDIF
+       IF ( nCpu > 0 .and. tCpuMax > 0.0_dp ) THEN
+          rNew = ( wTot - REAL( HybWork(nGpu), dp ) ) / tCpuMax
+          IF ( HybRateCpu > 0.0_dp ) THEN
+             HybRateCpu = 0.5_dp * HybRateCpu + 0.5_dp * rNew
+          ELSE
+             HybRateCpu = rNew
+          ENDIF
+       ENDIF
+
+       ! ---- bookkeeping + per-timestep diagnostic line ----
+       GpuNcalls   = GpuNcalls   + 1
+       GpuNcells   = GpuNcells   + nGpu
+       GpuTapi     = GpuTapi     + gpuTa
+       GpuTkernel  = GpuTkernel  + gpuTk
+       GpuTwall    = GpuTwall    + gpuTw
+       HybCellsCpu = HybCellsCpu + nCpu
+       HybTcpu     = HybTcpu     + tCpuMax
+       HybTsolve   = HybTsolve   + tRegion
+       IF ( Input_Opt%amIRoot ) THEN
+          WRITE( 6, '(a,i4,a,i7,a,i7,a,f6.3,a,i2,a,f8.3,a,f8.3,a,f8.3,a,f8.3,a,i4,a,f9.2,a,f9.2,a,f9.2)' ) &
+               'GC_HYB_CHEM: call', GpuNcalls, ' nGpu=', nGpu,               &
+               ' nCpu=', nCpu, ' frac=', HybWorkFrac, ' ndev=', nDevUse,     &
+               ' t_head=', tThr, ' t_gpu=', gpuTw, ' t_cpu=', tCpuMax,       &
+               ' t_loop=', tRegion,                                          &
+               ' nFail=', nFail, ' cum_loop=', HybTsolve,                    &
+               ' cum_gpu=', GpuTwall, ' cum_cpu=', HybTcpu
+          IF ( nDevUse > 1 ) THEN
+             WRITE( 6, '(a,16(f7.3,1x))' ) 'GC_HYB_CHEM:   per-device t_gpu=',&
+                  ( devTw(d), d = 0, nDevUse-1 )
+             WRITE( 6, '(a,16(i7,1x))' )   'GC_HYB_CHEM:   per-device nCell=',&
+                  ( devHi(d)-devLo(d)+1, d = 0, nDevUse-1 )
+          ENDIF
+       ENDIF
+       DEALLOCATE( HybWork, BatchC0, BatchISTAT8, BatchRSTAT3, BatchIERR )
+
+       ELSE   ! BatchMode == 1: CPU batch solve loop
+#endif
+       !--------------------------------------------------------------------
+       ! (c) Solve the batch (expensive cells dispatched first)
+       !--------------------------------------------------------------------
+       !$OMP PARALLEL DO                                                     &
+       !$OMP DEFAULT( SHARED                                                )&
+       !$OMP PRIVATE( ic,      idx,      I,       J,        L,       N      )&
+       !$OMP PRIVATE( IERR,    ICNTRL,   RCNTRL,  ISTATUS,  RSTATE,  Cb4    )&
+       !$OMP PRIVATE( TimeStart,         TimeEnd                            )&
+       !$OMP SCHEDULE( DYNAMIC, 24                                          )&
+       !$OMP REDUCTION( +:errorCount                                        )
+       DO ic = 1, nCell
+
+          ! Skip to the end of the loop if we have failed integration twice
+          IF ( Failed2x ) CYCLE
+
+          idx = BatchPerm(ic)
+          I   = BatchMap(1,idx)
+          J   = BatchMap(2,idx)
+          L   = BatchMap(3,idx)
+
+          ! Start measuring KPP solve timing for this grid box.
+          ! NOTE: on the batched path this covers the solve only (the
+          ! setup work was timed inside the gather loop is not included).
+          IF ( State_Diag%Archive_KppTime ) THEN
+             CALL cpu_time( TimeStart )
+          ENDIF
+
+          ICNTRL = BatchICNTRL(:,idx)
+          RCNTRL = BatchRCNTRL(:,idx)
+
+          ! Keep the pre-solve concentrations so that we can reset them
+          ! before calling the integrator a 2nd time (mirrors the stock
+          ! C_before_integrate logic).
+          Cb4 = BatchC(:,idx)
+
+          ! Call the argument-based batched integrator (replicates the
+          ! stock wrapper's option merging + ros_Integrator numerics)
+          CALL Integrate_Model( 0.0_dp, DT, ICNTRL, RCNTRL, ATOL, RTOL,      &
+                                BatchC(1:NVAR,idx),                          &
+                                BatchC(NVAR+1:NSPEC,idx),                    &
+                                BatchRCONST(:,idx),                          &
+                                ISTATUS, RSTATE, IERR )
+
+          BatchISTATUS(:,idx) = ISTATUS
+          BatchRSTATE(:,idx)  = RSTATE
+
+          ! Check for negative concentrations after first integration
+          ! (stock code archives this after the FIRST attempt)
+          IF ( State_Diag%Archive_KppDiags ) THEN
+             IF ( State_Diag%Archive_KppNegatives0 ) THEN
+                State_Diag%KppNegatives0(I,J,L) =                            &
+                     REAL( COUNT( BatchC(:,idx) < 0.0_dp ), KIND=4 )
+             ENDIF
+          ENDIF
+
+          ! Print grid box indices to screen if integrate failed
+          IF ( IERR < 0 ) THEN
+             ! Turn off error output after a certain limit is reached
+             IF ( .not. doSuppress ) THEN
+                WRITE( 6, * ) '### INTEGRATE RETURNED ERROR AT: ', I, J, L
+                errorCount = errorCount + 1
+                IF ( errorCount > INTEGRATE_FAIL_TOGGLE ) THEN
+                   WRITE( 6, '(a)' ) &
+                      '### Further error output has been switched off'
+                   doSuppress = .TRUE.
+                ENDIF
+             ENDIF
+          ENDIF
+
+          !==================================================================
+          ! Try another time if it failed
+          !==================================================================
+          IF ( IERR < 0 ) THEN
+
+             ! Zero the first time step (Hstart).  Also reset the cell's
+             ! concentrations to their values prior to the 1st solve.
+             ! NOTE: the stock path calls Update_RCONST() again here, which
+             ! recomputes identical values (its inputs are unchanged); the
+             ! batched path reuses the gathered RCONST (same approach as
+             ! the MPI load-balancing path).
+             RCNTRL(3)     = 0.0_dp
+             BatchC(:,idx) = Cb4
+
+             ! Call the integrator again
+             CALL Integrate_Model( 0.0_dp, DT, ICNTRL, RCNTRL, ATOL, RTOL,   &
+                                   BatchC(1:NVAR,idx),                       &
+                                   BatchC(NVAR+1:NSPEC,idx),                 &
+                                   BatchRCONST(:,idx),                       &
+                                   ISTATUS, RSTATE, IERR )
+
+             ! Accumulate counters over both attempts (the stock code
+             ! archives attempt 1 with "=" and attempt 2 with "+=")
+             BatchISTATUS(:,idx) = BatchISTATUS(:,idx) + ISTATUS
+             BatchRSTATE(:,idx)  = RSTATE
+
+             !===============================================================
+             ! Exit upon the second failure
+             !===============================================================
+             IF ( IERR < 0 ) THEN
+
+                ! Print error message
+                WRITE(6,     '(a   )' ) '## INTEGRATE FAILED TWICE !!! '
+                WRITE(ERRMSG,'(a,i3)' ) 'Integrator error code :', IERR
+
+                !%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                ! Make sure only one thread at a time executes this block
+                !$OMP CRITICAL
+                !
+                ! Set a flag to break out of loop gracefully
+                Failed2x = .TRUE.
+
+                ! Print concentrations at failure grid box
+                PRINT*, REPEAT( '#', 79 )
+                PRINT*, '### KPP DEBUG OUTPUT!'
+                PRINT*, '### Species concentrations at problem box ', I, J, L
+                PRINT*, REPEAT( '#', 79 )
+                DO N = 1, NSPEC
+                   PRINT*, BatchC(N,idx), TRIM( ADJUSTL( SPC_NAMES(N) ) )
+                ENDDO
+
+                ! Print rate constants at failure grid box
+                PRINT*, REPEAT( '#', 79 )
+                PRINT*, '### KPP DEBUG OUTPUT!'
+                PRINT*, '### Reaction rates at problem box ', I, J, L
+                PRINT*, REPEAT( '#', 79 )
+                DO N = 1, NREACT
+                   PRINT*, BatchRCONST(N,idx), TRIM( ADJUSTL( EQN_NAMES(N) ) )
+                ENDDO
+                !
+                !$OMP END CRITICAL
+                !%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+                ! Start skipping to end of loop upon 2 failures in a row
+                CYCLE
+             ENDIF
+          ENDIF
+
+          ! Persist this cell's internal step count: it is next timestep's
+          ! cost-sort key.
+          BatchPrevNsteps(I,J,L) = BatchISTATUS(3,idx)
+
+          ! Save cpu time spent in the solve for History archival
+          IF ( State_Diag%Archive_KppTime ) THEN
+             CALL cpu_time( TimeEnd )
+             State_Diag%KppTime(I,J,L) = TimeEnd - TimeStart
+          ENDIF
+
+       ENDDO
+       !$OMP END PARALLEL DO
+#ifdef GC_GPU_CHEM
+       ENDIF   ! BatchMode
+#endif
+
+    ENDIF
+
+    IF ( DoBatchChem .and. ( .not. Failed2x ) ) THEN
+       !--------------------------------------------------------------------
+       ! (d) Scatter results back (identical to the stock loop's post-solve
+       !     code; C and RCONST are restored into the THREADPRIVATE KPP
+       !     globals per cell so the same helper routines can run).
+       ! NOTE: the KPP-standalone sample writer (KppSa_Write_Samples) is
+       ! not supported on the batched path.
+       !--------------------------------------------------------------------
+       !$OMP PARALLEL DO                                                     &
+       !$OMP DEFAULT( SHARED                                                )&
+       !$OMP PRIVATE( ic,      I,        J,       L,        N,       S      )&
+       !$OMP PRIVATE( F,       KppID,    SpcID,   ISTATUS,  RSTATE,  RC     )&
+       !$OMP PRIVATE( OHreact, LCH4,     PCO_TOT, PCO_CH4,  PCO_NMVOC       )&
+       !$OMP SCHEDULE( DYNAMIC, 24                                          )
+       DO ic = 1, nHead
+
+          I = BatchMap(1,ic)
+          J = BatchMap(2,ic)
+          L = BatchMap(3,ic)
+
+          ! Restore this cell's state into the THREADPRIVATE KPP globals
+          C       = BatchC(:,ic)
+          RCONST  = BatchRCONST(:,ic)
+          ISTATUS = BatchISTATUS(:,ic)
+          RSTATE  = BatchRSTATE(:,ic)
+
+          !===================================================================
+          ! Continue upon successful return...
+          !===================================================================
+
+          ! Revert Alkalinity (only when using sulfur chemistry in KPP)
+          IF ( .not. State_Chm%Do_SulfateMod_SeaSalt ) THEN
+             CALL fullchem_ConvertEquivToAlk()
+          ENDIF
+
+          ! Save Hnew (the last predicted but not taken step) from the 3rd
+          ! slot of RSTATE into State_Chm so that it can be written to the
+          ! restart file.
+          State_Chm%KPPHvalue(I,J,L) = RSTATE(Nhnew)
+
+          !===================================================================
+          ! HISTORY: Archive KPP solver diagnostics
+          ! (KppNegatives0 was archived in the solve loop above, right
+          ! after the first integration attempt, as in the stock code.)
+          !===================================================================
+          IF ( State_Diag%Archive_KppDiags ) THEN
+
+             ! # of integrator calls
+             IF ( State_Diag%Archive_KppIntCounts ) THEN
+                State_Diag%KppIntCounts(I,J,L) = ISTATUS(1)
+             ENDIF
+
+             ! # of times Jacobian was constructed
+             IF ( State_Diag%Archive_KppJacCounts ) THEN
+                State_Diag%KppJacCounts(I,J,L) = ISTATUS(2)
+             ENDIF
+
+             ! # of internal timesteps
+             IF ( State_Diag%Archive_KppTotSteps ) THEN
+                State_Diag%KppTotSteps(I,J,L) = ISTATUS(3)
+             ENDIF
+
+             ! # of accepted internal timesteps
+             IF ( State_Diag%Archive_KppAccSteps ) THEN
+                State_Diag%KppAccSteps(I,J,L) = ISTATUS(4)
+             ENDIF
+
+             ! # of rejected internal timesteps
+             IF ( State_Diag%Archive_KppRejSteps ) THEN
+                State_Diag%KppRejSteps(I,J,L) = ISTATUS(5)
+             ENDIF
+
+             ! # of LU-decompositions
+             IF ( State_Diag%Archive_KppLuDecomps ) THEN
+                State_Diag%KppLuDecomps(I,J,L) = ISTATUS(6)
+             ENDIF
+
+             ! # of forward and backwards substitutions
+             IF ( State_Diag%Archive_KppSubsts ) THEN
+                State_Diag%KppSubsts(I,J,L) = ISTATUS(7)
+             ENDIF
+
+             ! # of singular-matrix decompositions
+             IF ( State_Diag%Archive_KppSmDecomps ) THEN
+                State_Diag%KppSmDecomps(I,J,L) = ISTATUS(8)
+             ENDIF
+          ENDIF
+
+          !===================================================================
+          ! Check we have no negative values and copy the concentrations
+          ! calculated from the C array back into State_Chm%Species%Conc
+          !===================================================================
+
+          ! Loop over KPP species
+          DO N = 1, NSPEC
+
+             ! GEOS-Chem species ID
+             SpcID = State_Chm%Map_KppSpc(N)
+
+             ! Skip if this is not a GEOS-Chem species
+             IF ( SpcID <= 0 ) CYCLE
+
+             ! Scan for negatives
+             IF ( State_Diag%Archive_KppNegatives ) THEN
+                IF ( C(N) < 0.0_dp ) THEN
+                   State_Diag%KppNegatives(I,J,L) = &
+                        State_Diag%KppNegatives(I,J,L) + 1.0_f4
+                ENDIF
+             ENDIF
+
+             ! Set negative concentrations to zero
+             C(N) = MAX( C(N), 0.0_dp )
+
+             ! Copy concentrations back into State_Chm%Species
+             State_Chm%Species(SpcID)%Conc(I,J,L) = REAL( C(N), kind=fp )
+
+          ENDDO
+
+#ifdef TOMAS
+          !-----------------------------------------------------------------
+          ! FOR TOMAS MICROPHYSICS:
+          !
+          ! Obtain P/L with a unit [kg S] for tracing
+          ! gas-phase sulfur species production (SO2, SO4, MSA)
+          !-----------------------------------------------------------------
+
+          ! Calculate H2SO4 production rate [kg s-1] in each
+          ! time step (win, 8/4/09)
+          H2SO4_RATE(I,J,L) = C(ind_PH2SO4) / AVO * 98.e-3_fp * &
+                              State_Met%AIRVOL(I,J,L)    * &
+                              1.0e+6_fp / DT  ! kg s-1 box-1
+
+          IF ( H2SO4_RATE(I,J,L) < 0.0d0) THEN
+             write(*,*) "H2SO4_RATE negative in fullchem_mod.F90!!", &
+                  I, J, L, "was:", H2SO4_RATE(I,J,L), "  setting to 0.0d0"
+             H2SO4_RATE(I,J,L) = 0.0d0
+          ENDIF
+
+          PSO4AQ_RATE(I,J,L) = C(ind_PSO4AQ) / AVO * 98.e-3_fp * &
+                               State_Met%AIRVOL(I,J,L)    * &
+                               1.0e+6_fp ! kg per timestep box-1
+
+          IF ( PSO4AQ_RATE(I,J,L) < 0.0d0) THEN
+             write(*,*) "PSO4AQ_RATE negative in fullchem_mod.F90", &
+                  I, J, L, "was:", PSO4AQ_RATE(I,J,L), "  setting to 0.0d0"
+             PSO4AQ_RATE(I,J,L) = 0.0d0
+          ENDIF
+#endif  ! TOMAS
+
+          !===================================================================
+          ! HISTORY (aka netCDF diagnostics)
+          !
+          ! Prod and loss of families or species [molec/cm3/s]
+          !===================================================================
+
+          ! Chemical loss of species or families [molec/cm3/s]
+          IF ( State_Diag%Archive_Loss ) THEN
+             DO S = 1, State_Diag%Map_Loss%nSlots
+                KppId = State_Diag%Map_Loss%slot2Id(S)
+                State_Diag%Loss(I,J,L,S) = C(KppID) / DT
+             ENDDO
+          ENDIF
+
+          ! Chemical production of species or families [molec/cm3/s]
+          IF ( State_Diag%Archive_Prod ) THEN
+             DO S = 1, State_Diag%Map_Prod%nSlots
+                KppID = State_Diag%Map_Prod%slot2Id(S)
+                State_Diag%Prod(I,J,L,S) = C(KppID) / DT
+             ENDDO
+          ENDIF
+
+          ! Satellite diagnostic: Chemical loss [molec/cm3/s]
+          IF ( State_Diag%Archive_SatDiagnLoss ) THEN
+             DO S = 1, State_Diag%Map_SatDiagnLoss%nSlots
+                KppId = State_Diag%Map_SatDiagnLoss%slot2Id(S)
+                State_Diag%SatDiagnLoss(I,J,L,S) = C(KppID) / DT
+             ENDDO
+          ENDIF
+
+          ! Satellite diagnostic: Chemical production [molec/cm3/s]
+          IF ( State_Diag%Archive_SatDiagnProd ) THEN
+             DO S = 1, State_Diag%Map_SatDiagnProd%nSlots
+                KppID = State_Diag%Map_SatDiagnProd%slot2Id(S)
+                State_Diag%SatDiagnProd(I,J,L,S) = C(KppID) / DT
+             ENDDO
+          ENDIF
+
+          !-------------------------------------------------------------------
+          ! Archive prod/loss fields for CO in the carbon simulation
+          ! [molec/cm3/s]
+          !-------------------------------------------------------------------
+          IF ( State_Diag%Archive_ProdCOfromCH4     .or.    &
+               State_Diag%Archive_ProdCOfromNMVOC ) THEN
+
+             ! Total production of CO
+             PCO_TOT   = C(id_PCO) / DT
+
+             ! Loss of CO from CH4
+             LCH4      = C(id_LCH4) / DT
+
+             ! P(CO)_CH4 is LCH4. Cap so that it is never greater
+             ! than total P(CO) to prevent negative P(CO)_NMVOC.
+             PCO_CH4   = MIN( LCH4, PCO_TOT )
+
+             ! P(CO) from NMVOC is the remaining P(CO)
+             PCO_NMVOC = PCO_TOT - PCO_CH4
+
+             ! Archive P(CO) from CH4 for CO in carbon simulations
+             IF ( State_Diag%Archive_ProdCOfromCH4 ) THEN
+                State_Diag%ProdCOfromCH4(I,J,L) = PCO_CH4
+             ENDIF
+
+             ! Archive P(CO) from NMVOC for CO in carbon simulations
+             IF ( State_Diag%Archive_ProdCOfromNMVOC ) THEN
+                State_Diag%ProdCOfromNMVOC(I,J,L) = PCO_NMVOC
+             ENDIF
+
+          ENDIF
+
+          !===================================================================
+          ! HISTORY (aka netCDF diagnostics)
+          !
+          ! Write out OH reactivity.
+          !===================================================================
+          IF ( State_Diag%Archive_OHreactivity           .or.  &
+               State_Diag%Archive_SatDiagnOHreactivity ) THEN
+
+             ! Archive OH reactivity diagnostic
+             CALL Get_OHreactivity ( C, RCONST, OHreact )
+             IF ( State_Diag%Archive_OHreactivity ) THEN
+                State_Diag%OHreactivity(I,J,L) = OHreact
+             ENDIF
+             IF ( State_Diag%Archive_SatDiagnOHreactivity ) THEN
+                State_Diag%SatDiagnOHreactivity(I,J,L) = OHreact
+             ENDIF
+
+          ENDIF
+
+       ENDDO
+       !$OMP END PARALLEL DO
+    ENDIF
+#endif  ! ( .not. MPI_LOAD_BALANCE ): batched chemistry solve + scatter
 
 #ifdef MPI_LOAD_BALANCE
     !=====================================================================
@@ -4219,4 +5632,41 @@ CONTAINS
    
   END SUBROUTINE Cleanup_FullChem
 !EOC
+#ifdef GC_GPU_CHEM
+!EOC
+!------------------------------------------------------------------------------
+!                  GEOS-Chem Global Chemical Transport Model                  !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: acc_register_library
+!
+! !DESCRIPTION: No-op OpenACC profiling-registration hook (GPU batch path).
+!  The NVIDIA OpenACC runtime (libacchost, pulled in by libgcchemgpu.so)
+!  references acc\_register\_library WEAKLY and calls it at initialisation if
+!  any loaded object defines it.  gfortran's libgomp exports a stub of that
+!  name that aborts with "libgomp: TODO".  Defining the hook in the
+!  executable (first in the dynamic linker's global scope) makes the weak
+!  reference bind here instead, which is what lets a gfortran-built model
+!  link the nvfortran-built library directly.  It is a module procedure of
+!  FullChem\_Mod only so that it is guaranteed to be linked in.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE acc_register_library( reg, unreg, lookup )                      &
+             BIND(C, name='acc_register_library')
+!
+! !USES:
+!
+    USE ISO_C_BINDING, ONLY : C_PTR
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(C_PTR), VALUE :: reg, unreg, lookup   ! ignored
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+  END SUBROUTINE acc_register_library
+#endif
 END MODULE FullChem_Mod

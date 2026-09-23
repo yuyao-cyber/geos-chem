@@ -24,12 +24,11 @@
 
 
 MODULE gckpp_Jacobian
-
-  USE gckpp_Global, ONLY: DO_JVS
   USE gckpp_Parameters
   USE gckpp_JacobianSP
 
   IMPLICIT NONE
+  LOGICAL, PRIVATE, PARAMETER :: DO_JVS(5683) = .TRUE.
 
 CONTAINS
 
@@ -46,6 +45,7 @@ CONTAINS
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SUBROUTINE Jac_SP ( V, F, RCT, JVS )
+  !$acc routine seq
 
 ! V - Concentrations of variable species (local)
   REAL(kind=dp) :: V(NVAR)

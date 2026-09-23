@@ -24,15 +24,11 @@
 
 
 MODULE gckpp_Function
-
-  USE gckpp_Global, only : DO_FUN
   USE gckpp_Parameters
   IMPLICIT NONE
+  LOGICAL, PRIVATE, PARAMETER :: DO_FUN(353) = .TRUE.
 
 ! A - Rate for each equation
-  REAL(kind=dp) :: A(NREACT)
-  !$OMP THREADPRIVATE(  A )
-
 CONTAINS
 
 
@@ -49,6 +45,8 @@ CONTAINS
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SUBROUTINE Fun ( V, F, RCT, Vdot, Aout )
+  !$acc routine seq
+  REAL(kind=dp) :: A(NREACT)
 
 ! V - Concentrations of variable species (local)
   REAL(kind=dp) :: V(NVAR)
@@ -2170,6 +2168,8 @@ END SUBROUTINE Fun
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SUBROUTINE Fun_SPLIT ( V, F, RCT, Vdot, P_VAR, D_VAR, Aout )
+  !$acc routine seq
+  REAL(kind=dp) :: A(NREACT)
 
 ! V - Concentrations of variable species (local)
   REAL(kind=dp) :: V(NVAR)
@@ -5079,6 +5079,8 @@ END SUBROUTINE Fun_SPLIT
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SUBROUTINE Fun_SPLITF ( V, F, RCT, P_VAR, D_VAR, Aout )
+  !$acc routine seq
+  REAL(kind=dp) :: A(NREACT)
 
 ! V - Concentrations of variable species (local)
   REAL(kind=dp) :: V(NVAR)
@@ -7267,6 +7269,7 @@ END SUBROUTINE Fun_SPLITF
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SUBROUTINE CalcStoichNum ( StoichNum )
+  !$acc routine seq
 
 ! StoichNum - Stoichiometric numbers
   REAL(kind=dp) :: StoichNum(NVAR,NREACT)

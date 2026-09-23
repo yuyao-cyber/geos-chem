@@ -24,12 +24,12 @@
 
 
 MODULE gckpp_LinearAlgebra
-
-  USE gckpp_Global, ONLY: DO_SLV
   USE gckpp_Parameters
   USE gckpp_JacobianSP
 
   IMPLICIT NONE
+  LOGICAL, PRIVATE, SAVE :: DO_SLV(354) = .TRUE.
+  !$acc declare copyin(DO_SLV)
 
 CONTAINS
 
@@ -44,6 +44,7 @@ CONTAINS
 
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 SUBROUTINE KppDecomp( JVS, IER )
+  !$acc routine seq
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 !        Sparse LU factorization
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -642,6 +643,7 @@ END SUBROUTINE KppSolveTRCmplxR
 ! ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SUBROUTINE KppSolve ( JVS, X )
+  !$acc routine seq
 
 ! JVS - sparse Jacobian of variables
   REAL(kind=dp) :: JVS(LU_NONZERO)

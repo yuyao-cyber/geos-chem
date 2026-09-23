@@ -54,6 +54,7 @@ add_library(KPP
   fullchem_HetStateFuncs.F90
   fullchem_RateLawFuncs.F90
   fullchem_SulfurChemFuncs.F90
+  gckpp_BatchIntegrator.F90
   gckpp_Function.F90
   gckpp_Global.F90
   gckpp_Initialize.F90
@@ -102,4 +103,17 @@ if("${CMAKE_Fortran_COMPILER_ID}" STREQUAL "GNU")
       COMPILE_OPTIONS -fno-var-tracking-assignments
     )
   endif()
+endif()
+
+#----------------------------------------------------------------------------
+# Optional (GNU only): allow fused multiply-add contraction in the KPP
+# library only (-mfma).  Used as a CONTROL experiment: the GPU solver
+# contracts a*b+c into FMA, so this shows how large a purely
+# rounding-level perturbation of the solver is when everything else is
+# bit-identical.  Default OFF = stock behaviour.
+#----------------------------------------------------------------------------
+option(KPP_FMA "Allow FMA contraction in the KPP library (gfortran -mfma)" OFF)
+if(KPP_FMA AND ("${CMAKE_Fortran_COMPILER_ID}" STREQUAL "GNU"))
+  target_compile_options(KPP PRIVATE -mfma -ffp-contract=fast)
+  message(STATUS "KPP_FMA=ON: KPP library compiled with -mfma -ffp-contract=fast")
 endif()
